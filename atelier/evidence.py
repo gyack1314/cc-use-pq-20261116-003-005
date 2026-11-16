@@ -26,6 +26,20 @@ class EvidenceService:
             for row in specs:
                 if digest(json.loads(row["body"])) != row["content_sha"]:
                     issues.append({"kind": "spec_digest", "version": row["version"]})
+            composition_rows = db.execute("SELECT composition_id,version,body,content_sha"
+                                          " FROM compositions WHERE campaign_id=?"
+                                          " ORDER BY composition_id,version", (campaign_id,)).fetchall()
+            composition_versions: dict[str, list[int]] = {}
+            for row in composition_rows:
+                composition_versions.setdefault(row["composition_id"], []).append(row["version"])
+                if digest(json.loads(row["body"])) != row["content_sha"]:
+                    issues.append({"kind": "composition_digest",
+                                   "composition_id": row["composition_id"],
+                                   "version": row["version"]})
+            for composition_id, versions in composition_versions.items():
+                if versions != list(range(1, len(versions) + 1)):
+                    issues.append({"kind": "composition_gap", "composition_id": composition_id,
+                                   "actual": versions})
             sample_rows = db.execute("SELECT sample_id,group_id,event_time,spec_version,measurements,"
                                      "content_sha,status FROM samples WHERE campaign_id=? ORDER BY sample_id",
                                      (campaign_id,)).fetchall()
@@ -68,7 +82,8 @@ class EvidenceService:
                                 (campaign_id,)).fetchall()
             event_kinds = Counter(row["kind"] for row in audits)
             return {"campaign_id": campaign_id, "ok": not issues, "issues": issues,
-                    "counts": {"spec_versions": len(specs), "batches": len(batch_rows),
+                    "counts": {"spec_versions": len(specs), "compositions": len(composition_rows),
+                               "batches": len(batch_rows),
                                "samples": len(sample_rows), "analyses": len(analysis_rows),
                                "releases": len(release_rows), "audits": len(audits)},
                     "event_kinds": dict(sorted(event_kinds.items()))}
@@ -85,6 +100,9 @@ class EvidenceService:
             batches = [dict(row) for row in db.execute(
                 "SELECT batch_id,payload_sha,spec_version,accepted,rejected,created_at"
                 " FROM batches WHERE campaign_id=? ORDER BY created_at,batch_id", (campaign_id,))]
+            compositions = [dict(row) for row in db.execute(
+                "SELECT composition_id,version,content_sha,created_at FROM compositions"
+                " WHERE campaign_id=? ORDER BY composition_id,version", (campaign_id,))]
             samples = self.store.list_samples(campaign_id, db=db)
             rejections = [dict(row) for row in db.execute(
                 "SELECT batch_id,ordinal,sample_id,reason,detail,event_time"
@@ -99,8 +117,9 @@ class EvidenceService:
                 "SELECT release_id,analysis_id,source_revision,result_sha,created_at"
                 " FROM releases WHERE campaign_id=? ORDER BY created_at,release_id", (campaign_id,))]
             audits = self.store.list_audits(campaign_id, limit=100000)
-            payload = {"campaign": campaign, "specs": specs, "batches": batches,
-                       "samples": samples, "rejections": rejections, "analyses": analyses,
-                       "reviews": reviews, "releases": releases, "audits": audits}
+            payload = {"campaign": campaign, "specs": specs, "compositions": compositions,
+                       "batches": batches, "samples": samples, "rejections": rejections,
+                       "analyses": analyses, "reviews": reviews, "releases": releases,
+                       "audits": audits}
             return {"campaign_id": campaign_id, "payload": payload, "digest": digest(payload),
                     "verification": verification}

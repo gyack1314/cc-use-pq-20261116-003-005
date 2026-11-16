@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from .analysis import Analyzer
+from .composition import CompositionService
 from .domain import CampaignSpec, DomainError, integer, parse_time, require_identifier
 from .ingest import Ingestor
 from .inspection import Inspector
@@ -30,13 +31,15 @@ def create_app(database_path: str | None = None) -> FastAPI:
     query_service = QueryService(store)
     explorer = Explorer(store)
     lifecycle = Lifecycle(store)
+    compositions = CompositionService(store)
     app = FastAPI(title="Atelier Experiment Ledger", version="1.0.0")
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(_, error: DomainError):
         status = 404 if error.code == "not_found" else 409 if error.code.endswith("conflict") or error.code in {
             "stale_analysis", "inactive_sample", "release_conflict", "review_rejected",
-            "reviews_missing", "self_publish", "quality_failed", "incompatible_spec"} else 422
+            "reviews_missing", "self_publish", "quality_failed", "incompatible_spec",
+            "composition_superseded", "composition_conflict"} else 422
         return JSONResponse(status_code=status, content={"error": error.code, "detail": str(error)})
 
     @app.post("/campaigns", status_code=201)
@@ -80,6 +83,31 @@ def create_app(database_path: str | None = None) -> FastAPI:
     @app.get("/campaigns/{campaign_id}/lifecycle")
     def lifecycle_inventory(campaign_id: str):
         return lifecycle.inventory(campaign_id)
+
+    @app.post("/campaigns/{campaign_id}/compositions/{composition_id}", status_code=201)
+    def create_composition(campaign_id: str, composition_id: str, payload: dict[str, Any]):
+        return compositions.create(campaign_id, composition_id, payload, payload.get("actor"))
+
+    @app.put("/campaigns/{campaign_id}/compositions/{composition_id}")
+    def update_composition(campaign_id: str, composition_id: str, payload: dict[str, Any]):
+        return compositions.update(campaign_id, composition_id, payload,
+                                   payload.get("expected_version"), payload.get("actor"))
+
+    @app.get("/campaigns/{campaign_id}/compositions")
+    def list_compositions(campaign_id: str):
+        return compositions.list(campaign_id)
+
+    @app.get("/campaigns/{campaign_id}/compositions/{composition_id}")
+    def get_composition(campaign_id: str, composition_id: str, version: int | None = None):
+        return compositions.describe(campaign_id, composition_id, version)
+
+    @app.get("/campaigns/{campaign_id}/compositions/{composition_id}/versions")
+    def composition_versions(campaign_id: str, composition_id: str):
+        return compositions.versions(campaign_id, composition_id)
+
+    @app.get("/campaigns/{campaign_id}/composition-coverage/{composition_id}")
+    def composition_coverage(campaign_id: str, composition_id: str, version: int | None = None):
+        return inspector.composition_coverage(campaign_id, composition_id, version)
 
     @app.put("/campaigns/{campaign_id}/spec")
     def update_spec(campaign_id: str, payload: dict[str, Any]):
@@ -134,6 +162,16 @@ def create_app(database_path: str | None = None) -> FastAPI:
         return ingestor.correct(campaign_id, sample_id, payload.get("replacement"),
                                 payload.get("expected_sha"), payload.get("actor"))
 
+    @app.put("/campaigns/{campaign_id}/samples/{sample_id}/shift")
+    def reassign_shift(campaign_id: str, sample_id: str, payload: dict[str, Any]):
+        return ingestor.reassign_shift(campaign_id, sample_id, payload.get("shift_id"),
+                                       payload.get("expected_sha"), payload.get("reason"),
+                                       payload.get("actor"))
+
+    @app.get("/campaigns/{campaign_id}/samples/{sample_id}/shift-history")
+    def shift_history(campaign_id: str, sample_id: str):
+        return ingestor.shift_history(campaign_id, sample_id)
+
     @app.post("/campaigns/{campaign_id}/samples/{sample_id}/void")
     def void_sample(campaign_id: str, sample_id: str, payload: dict[str, Any]):
         return ingestor.void(campaign_id, sample_id, payload.get("expected_sha"),
@@ -142,7 +180,8 @@ def create_app(database_path: str | None = None) -> FastAPI:
     @app.post("/campaigns/{campaign_id}/analyses/{analysis_id}")
     def build_analysis(campaign_id: str, analysis_id: str, payload: dict[str, Any]):
         return analyzer.build(campaign_id, analysis_id, payload.get("start"),
-                              payload.get("end"), payload.get("actor"))
+                              payload.get("end"), payload.get("actor"),
+                              payload.get("composition_id"), payload.get("composition_version"))
 
     @app.get("/campaigns/{campaign_id}/analyses")
     def list_analyses(campaign_id: str, limit: int = Query(100, ge=1, le=500)):
@@ -156,6 +195,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def analysis_status(campaign_id: str, analysis_id: str):
         return analyzer.status(campaign_id, analysis_id)
 
+    @app.get("/campaigns/{campaign_id}/analyses/{analysis_id}/shift-impact")
+    def shift_impact(campaign_id: str, analysis_id: str):
+        return analyzer.shift_impact(campaign_id, analysis_id)
+
     @app.get("/campaigns/{campaign_id}/analyses/{first_id}/compare/{second_id}")
     def compare_analyses(campaign_id: str, first_id: str, second_id: str):
         return inspector.compare_analyses(campaign_id, first_id, second_id)
@@ -163,7 +206,9 @@ def create_app(database_path: str | None = None) -> FastAPI:
     @app.post("/campaigns/{campaign_id}/analyses/{analysis_id}/reviews")
     def review(campaign_id: str, analysis_id: str, payload: dict[str, Any]):
         return publisher.review(campaign_id, analysis_id, payload.get("reviewer"),
-                                payload.get("decision"), payload.get("note"), payload.get("expected_sha"))
+                                payload.get("decision"), payload.get("note"), payload.get("expected_sha"),
+                                payload.get("population"), payload.get("composition_id"),
+                                payload.get("composition_version"))
 
     @app.get("/campaigns/{campaign_id}/analyses/{analysis_id}/reviews")
     def list_reviews(campaign_id: str, analysis_id: str):

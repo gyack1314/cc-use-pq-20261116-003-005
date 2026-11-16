@@ -5,7 +5,7 @@ from decimal import Decimal
 import json
 from typing import Any
 
-from .analysis import group_statistics
+from .composition import CompositionService
 from .domain import DomainError, parse_time, require_identifier
 from .quality import metric_health, validate_window
 from .store import Store
@@ -21,8 +21,9 @@ class Inspector:
         with self.store.connect() as db:
             batch = self.store.one(db, "SELECT * FROM batches WHERE campaign_id=? AND batch_id=?",
                                    (campaign_id, batch_id))
-            accepted = db.execute("SELECT sample_id,group_id,event_time,status,content_sha"
-                                  " FROM samples WHERE campaign_id=? AND batch_id=? ORDER BY sample_id",
+            accepted = db.execute("SELECT sample_id,group_id,shift_id,shift_source,event_time,"
+                                  "status,content_sha FROM samples WHERE campaign_id=? AND batch_id=?"
+                                  " ORDER BY sample_id",
                                   (campaign_id, batch_id)).fetchall()
             rejected = db.execute("SELECT ordinal,sample_id,reason,detail,event_time"
                                   " FROM rejections WHERE campaign_id=? AND batch_id=? ORDER BY ordinal",
@@ -56,6 +57,37 @@ class Inspector:
                     "samples": dict(statuses), "analyses": dict(analyses),
                     "releases": releases, "last_audit_id": last_audit}
 
+    def composition_coverage(self, campaign_id: str, composition_id: str,
+                             version: int | None = None) -> dict[str, Any]:
+        """Sample counts per group and shift against the target population."""
+        require_identifier(campaign_id, "campaign_id")
+        require_identifier(composition_id, "composition_id")
+        with self.store.connect() as db:
+            spec = self.store.get_spec(campaign_id, db=db)
+            composition, content_sha = CompositionService(self.store).load(
+                campaign_id, composition_id, version, db)
+            rows = db.execute("SELECT group_id,shift_id,count(*) AS count FROM samples"
+                              " WHERE campaign_id=? AND status='active' GROUP BY group_id,shift_id",
+                              (campaign_id,)).fetchall()
+            counts: dict[str, dict[str, int]] = {}
+            for row in rows:
+                shift = "unassigned" if row["shift_id"] is None else row["shift_id"]
+                counts.setdefault(shift, {})[row["group_id"]] = row["count"]
+            weighted = {shift for shift, _ in composition.strata}
+            minimum = composition.min_samples if composition.min_samples is not None else spec.min_samples
+            gaps = [{"stratum": shift, "group": group,
+                     "samples": counts.get(shift, {}).get(group, 0), "required": minimum}
+                    for shift, _ in composition.strata for group in spec.groups
+                    if counts.get(shift, {}).get(group, 0) < minimum]
+            unweighted = {shift: counts[shift] for shift in counts if shift not in weighted}
+            return {"campaign_id": campaign_id, "composition_id": composition_id,
+                    "version": composition.version, "content_sha": content_sha,
+                    "population": composition.population,
+                    "weights": {shift: str(weight) for shift, weight in composition.strata},
+                    "min_samples_per_layer": minimum,
+                    "counts": counts, "insufficient_layers": gaps,
+                    "unweighted_strata": unweighted}
+
     def coverage(self, campaign_id: str, start: str, end: str) -> dict[str, Any]:
         require_identifier(campaign_id, "campaign_id")
         with self.store.connect() as db:
@@ -66,10 +98,15 @@ class Inspector:
             for sample in samples:
                 by_group[sample["group_id"]].append(sample)
             metrics = {group: metric_health(spec, by_group[group]) for group in spec.groups}
+            shifts: dict[str, dict[str, int]] = defaultdict(dict)
+            for sample in samples:
+                shift = "unassigned" if sample.get("shift_id") is None else sample["shift_id"]
+                shifts[shift][sample["group_id"]] = shifts[shift].get(sample["group_id"], 0) + 1
             older_versions = Counter(sample["spec_version"] for sample in samples)
             return {"campaign_id": campaign_id, "window": {"start": left, "end": right},
                     "groups": {group: {"samples": len(by_group[group]), "metrics": metrics[group]}
                                for group in spec.groups},
+                    "shifts": dict(sorted(shifts.items())),
                     "spec_versions": dict(sorted(older_versions.items())),
                     "active_total": len(samples)}
 
@@ -85,6 +122,10 @@ class Inspector:
                 raise DomainError("incomparable_analyses", "analyses must share the same window")
             if a["request"]["spec_version"] != b["request"]["spec_version"]:
                 raise DomainError("incomparable_analyses", "analyses must share the same specification version")
+            if (a["request"].get("composition_id"), a["request"].get("composition_version")) != (
+                    b["request"].get("composition_id"), b["request"].get("composition_version")):
+                raise DomainError("incomparable_analyses",
+                                  "analyses must share the same target composition version")
             changes = {}
             for group in a["groups"]:
                 metrics = {}

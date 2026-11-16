@@ -19,7 +19,7 @@ class Reconciler:
             campaign = self.store.get_campaign(campaign_id, db)
             events = db.execute("SELECT kind,subject,id FROM audits WHERE campaign_id=? ORDER BY id",
                                 (campaign_id,)).fetchall()
-            mutating = {"spec_updated", "sample_corrected", "sample_voided"}
+            mutating = {"spec_updated", "sample_corrected", "sample_voided", "shift_reassigned"}
             revision_events = [dict(row) for row in events if row["kind"] in mutating]
             batch_rows = db.execute("SELECT batch_id,accepted FROM batches WHERE campaign_id=?",
                                     (campaign_id,)).fetchall()
@@ -55,17 +55,48 @@ class Reconciler:
             campaign = self.store.get_campaign(campaign_id, db)
             rows = db.execute("SELECT analysis_id,source_revision,result_sha,body FROM analyses"
                               " WHERE campaign_id=? ORDER BY analysis_id", (campaign_id,)).fetchall()
+            latest: dict[str, int] = {}
+            for composition in db.execute("SELECT composition_id,max(version) AS version FROM compositions"
+                                          " WHERE campaign_id=? GROUP BY composition_id",
+                                          (campaign_id,)).fetchall():
+                latest[composition["composition_id"]] = composition["version"]
             analyses = []
             for row in rows:
                 body = json.loads(row["body"])
                 body_sha = body.pop("result_sha", None)
+                request = body.get("request", {})
+                target = body.get("target_composition") or {}
+                composition_current = None
+                if request.get("composition_id"):
+                    composition_current = (latest.get(request["composition_id"])
+                                           == request["composition_version"])
+                fresh = (row["source_revision"] == campaign["revision"]
+                         and composition_current is not False)
                 analyses.append({"analysis_id": row["analysis_id"],
                                  "source_revision": row["source_revision"],
                                  "current_revision": campaign["revision"],
-                                 "fresh": row["source_revision"] == campaign["revision"],
+                                 "composition_id": request.get("composition_id"),
+                                 "composition_version": request.get("composition_version"),
+                                 "composition_current": composition_current,
+                                 "composition_digest_valid": (
+                                     None if not target.get("content_sha")
+                                     else self._composition_digest(
+                                         db, campaign_id, target["composition_id"],
+                                         target["version"], target["content_sha"])),
+                                 "fresh": fresh,
                                  "digest_valid": body_sha == row["result_sha"] == digest(body)})
             return {"campaign_id": campaign_id, "analyses": analyses,
-                    "invalid_digests": [row["analysis_id"] for row in analyses if not row["digest_valid"]]}
+                    "invalid_digests": [row["analysis_id"] for row in analyses if not row["digest_valid"]],
+                    "stale_compositions": [row["analysis_id"] for row in analyses
+                                           if row["composition_current"] is False]}
+
+    @staticmethod
+    def _composition_digest(db, campaign_id: str, composition_id: str, version: int,
+                            recorded: str) -> bool:
+        row = db.execute("SELECT content_sha FROM compositions WHERE campaign_id=?"
+                         " AND composition_id=? AND version=?",
+                         (campaign_id, composition_id, version)).fetchone()
+        return row is not None and row["content_sha"] == recorded
 
     def releases(self, campaign_id: str) -> dict[str, Any]:
         require_identifier(campaign_id, "campaign_id")

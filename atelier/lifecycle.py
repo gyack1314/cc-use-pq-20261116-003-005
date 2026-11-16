@@ -16,6 +16,11 @@ class Lifecycle:
         require_identifier(campaign_id, "campaign_id")
         with self.store.connect() as db:
             campaign = self.store.get_campaign(campaign_id, db)
+            latest_composition: dict[str, int] = {}
+            for row in db.execute("SELECT composition_id,max(version) AS version FROM compositions"
+                                  " WHERE campaign_id=? GROUP BY composition_id",
+                                  (campaign_id,)).fetchall():
+                latest_composition[row["composition_id"]] = row["version"]
             analyses = db.execute("SELECT analysis_id,source_revision,body,created_at"
                                   " FROM analyses WHERE campaign_id=? ORDER BY created_at,analysis_id",
                                   (campaign_id,)).fetchall()
@@ -26,6 +31,11 @@ class Lifecycle:
             items = []
             for row in analyses:
                 body = json.loads(row["body"])
+                request = body.get("request", {})
+                composition_current = None
+                if request.get("composition_id"):
+                    composition_current = (latest_composition.get(request["composition_id"])
+                                           == request["composition_version"])
                 reviews = db.execute("SELECT decision,count(*) AS count FROM reviews"
                                      " WHERE campaign_id=? AND analysis_id=? GROUP BY decision",
                                      (campaign_id, row["analysis_id"])).fetchall()
@@ -34,6 +44,8 @@ class Lifecycle:
                     state = "published"
                 elif row["source_revision"] != campaign["revision"]:
                     state = "stale"
+                elif composition_current is False:
+                    state = "composition_superseded"
                 elif not body["quality"]["passed"]:
                     state = "quality_blocked"
                 elif counts.get("reject", 0):
@@ -43,7 +55,11 @@ class Lifecycle:
                 else:
                     state = "awaiting_reviews"
                 items.append({"analysis_id": row["analysis_id"], "state": state,
+                              "analysis_kind": body.get("analysis_kind", "pooled"),
                               "source_revision": row["source_revision"],
+                              "composition_id": request.get("composition_id"),
+                              "composition_version": request.get("composition_version"),
+                              "composition_current": composition_current,
                               "quality_gates": body["quality"]["gates"],
                               "reviews": counts, "created_at": row["created_at"]})
             return {"campaign_id": campaign_id, "current_revision": campaign["revision"],

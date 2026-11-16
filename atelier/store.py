@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS samples (
     sample_id TEXT NOT NULL,
     batch_id TEXT NOT NULL,
     group_id TEXT NOT NULL,
+    shift_id TEXT,
+    shift_source TEXT,
+    shift_updated_at TEXT,
     event_time TEXT NOT NULL,
     spec_version INTEGER NOT NULL,
     measurements TEXT NOT NULL,
@@ -82,6 +85,28 @@ CREATE TABLE IF NOT EXISTS analyses (
     created_at TEXT NOT NULL,
     PRIMARY KEY(campaign_id,analysis_id)
 );
+CREATE TABLE IF NOT EXISTS compositions (
+    campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+    composition_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    content_sha TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(campaign_id,composition_id,version)
+);
+CREATE TABLE IF NOT EXISTS shift_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id TEXT NOT NULL,
+    sample_id TEXT NOT NULL,
+    before_shift TEXT,
+    after_shift TEXT,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id,sample_id) REFERENCES samples(campaign_id,sample_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shift_corrections_sample
+    ON shift_corrections(campaign_id,sample_id,id);
 CREATE TABLE IF NOT EXISTS reviews (
     campaign_id TEXT NOT NULL,
     analysis_id TEXT NOT NULL,
@@ -89,6 +114,10 @@ CREATE TABLE IF NOT EXISTS reviews (
     decision TEXT NOT NULL,
     note TEXT NOT NULL,
     result_sha TEXT NOT NULL,
+    population TEXT,
+    composition_id TEXT,
+    composition_version INTEGER,
+    spec_version INTEGER,
     created_at TEXT NOT NULL,
     PRIMARY KEY(campaign_id,analysis_id,reviewer),
     FOREIGN KEY(campaign_id,analysis_id) REFERENCES analyses(campaign_id,analysis_id)
@@ -122,6 +151,23 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript(SCHEMA)
+            self._migrate(db)
+
+    @staticmethod
+    def _migrate(db: sqlite3.Connection) -> None:
+        # Databases created before target compositions existed keep their rows.
+        # Approvals made under the old unstratified contract have no population
+        # or composition recorded, so they cannot authorise a stratified result.
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(reviews)").fetchall()}
+        for name, kind in (("population", "TEXT"), ("composition_id", "TEXT"),
+                           ("composition_version", "INTEGER"), ("spec_version", "INTEGER")):
+            if name not in columns:
+                db.execute(f"ALTER TABLE reviews ADD COLUMN {name} {kind}")
+        sample_columns = {row["name"] for row in db.execute("PRAGMA table_info(samples)").fetchall()}
+        for name, kind in (("shift_id", "TEXT"), ("shift_source", "TEXT"),
+                           ("shift_updated_at", "TEXT")):
+            if name not in sample_columns:
+                db.execute(f"ALTER TABLE samples ADD COLUMN {name} {kind}")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=20, isolation_level=None, factory=ClosingConnection)
@@ -193,6 +239,8 @@ class Store:
             next_spec = CampaignSpec.from_dict({**supplied, "campaign_id": campaign_id}, expected_version + 1)
             if not set(previous["groups"]).issubset(next_spec.groups):
                 raise DomainError("incompatible_spec", "existing groups cannot be removed")
+            if not set(previous.get("shifts", [])).issubset(next_spec.shifts):
+                raise DomainError("incompatible_spec", "existing shifts cannot be removed")
             old_rules = {rule["name"]: rule for rule in previous["metrics"]}
             new_rules = {rule.name: rule for rule in next_spec.rules}
             for name, old in old_rules.items():

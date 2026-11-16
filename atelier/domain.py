@@ -124,6 +124,7 @@ class CampaignSpec:
     max_bad_fraction: Decimal
     window_hours: int
     baseline: str
+    shifts: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, item: dict[str, Any], version: int = 1) -> CampaignSpec:
@@ -153,14 +154,21 @@ class CampaignSpec:
         if not Decimal("0") <= fraction < Decimal("1"):
             raise DomainError("invalid_fraction", "max_bad_fraction must be in [0, 1)")
         hours = integer(item.get("window_hours", 24), "window_hours", 1, 720)
-        return cls(campaign_id, version, title.strip(), group_ids, rules, samples, fraction, hours, baseline)
+        shifts = item.get("shifts", [])
+        if not isinstance(shifts, list) or len(shifts) > 24:
+            raise DomainError("invalid_shifts", "shifts must be a list of at most 24 identifiers")
+        shift_ids = tuple(require_identifier(shift, "shift") for shift in shifts)
+        if len(set(shift_ids)) != len(shift_ids):
+            raise DomainError("invalid_shifts", "shift identifiers must be unique")
+        return cls(campaign_id, version, title.strip(), group_ids, rules, samples, fraction,
+                   hours, baseline, shift_ids)
 
     def to_dict(self) -> dict[str, Any]:
         return {"campaign_id": self.campaign_id, "version": self.version, "title": self.title,
                 "groups": list(self.groups), "baseline": self.baseline,
                 "metrics": [rule.to_dict() for rule in self.rules],
                 "min_samples": self.min_samples, "max_bad_fraction": str(self.max_bad_fraction),
-                "window_hours": self.window_hours}
+                "window_hours": self.window_hours, "shifts": list(self.shifts)}
 
     def validate_measurements(self, measurements: Any) -> dict[str, str]:
         if not isinstance(measurements, dict):
